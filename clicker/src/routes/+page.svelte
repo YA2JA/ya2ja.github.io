@@ -8,7 +8,13 @@
     import { goto } from '$app/navigation';
     import { supabase } from '../lib/supabaseClient';
     import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail } from '../lib/playerSession';
-    import { fetchTeamScores, recordClick, subscribeToClickerScores } from '../lib/games/clicker';
+    import {
+        fetchActiveFamilyPlayers,
+        fetchClickerSettings,
+        fetchTeamScores,
+        recordClick,
+        subscribeToClickerScores
+    } from '../lib/games/clicker';
 
     /**
      * @typedef {{
@@ -31,7 +37,33 @@
     let isMobile = $state(true);
     let isDebugMode = $state(false);
     let authError = $state('');
-    let isCooldown = $state(false);
+    let clickErrorMessage = $state('');
+    let settingsWarning = $state('');
+    let totalClicks = $state(0);
+    let clicksSinceBonus = $state(0);
+    let nextBonusAt = $state(30);
+    let familyExtraRemainder = 0;
+    let familyCoefficientPerPlayer = 1.1;
+    let activeFamilyPlayerCount = $state(0);
+    let activeFamilyPlayerIds = new Set();
+    /** @type {number} */
+    let familyMultiplier = $derived(
+        activeFamilyPlayerCount > 0
+            ? Math.pow(familyCoefficientPerPlayer, activeFamilyPlayerCount)
+            : 1
+    );
+    let bonusMinClicks = 30;
+    let bonusMaxClicks = 60;
+    let bonusMessage = $state('');
+    /** @type {Array<{ id: number, left: number, top: number, rotation: number }>} */
+    let clickParticles = $state([]);
+    /** @type {ReturnType<typeof setTimeout>[]} */
+    let particleTimeouts = [];
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let leaderboardTimeout;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let bonusMessageTimeout;
+    let nextParticleId = 0;
 
     // Thèmes visuels des maisons
     const houseStyles = {
@@ -85,6 +117,9 @@
 
     onDestroy(() => {
         if (clickSubscription) supabase.removeChannel(clickSubscription);
+        if (leaderboardTimeout) window.clearTimeout(leaderboardTimeout);
+        if (bonusMessageTimeout) window.clearTimeout(bonusMessageTimeout);
+        particleTimeouts.forEach((timeout) => window.clearTimeout(timeout));
     });
 
     async function checkDebugMode() {
@@ -125,28 +160,181 @@
 
         currentPlayer = player;
         playerGroup = player.group;
+
+        const { data: settings, error: settingsError } = await fetchClickerSettings();
+        if (settingsError) {
+            console.error('Réglages bonus Supabase indisponibles :', settingsError);
+            settingsWarning = 'Réglages Supabase indisponibles : seuil 30–60 et coefficient ×1,1 par défaut.';
+        } else if (settings) {
+            const minClicks = Number(settings.bonus_min_clicks);
+            const maxClicks = Number(settings.bonus_max_clicks);
+            const coefficient = Number(settings.family_coefficient_per_player);
+
+            if (
+                Number.isInteger(minClicks) &&
+                Number.isInteger(maxClicks) &&
+                minClicks > 0 &&
+                maxClicks >= minClicks &&
+                Number.isFinite(coefficient) &&
+                coefficient >= 1
+            ) {
+                bonusMinClicks = minClicks;
+                bonusMaxClicks = maxClicks;
+                familyCoefficientPerPlayer = coefficient;
+            } else {
+                settingsWarning = 'Réglages bonus invalides dans clicker_game_settings.';
+            }
+        }
+
+        const { count, error: countError } = await supabase
+            .from('ClickerCompetition')
+            .select('id', { count: 'exact', head: true })
+            .eq('author_id', player.id);
+        if (countError) {
+            console.error('Impossible de charger le score du joueur :', countError);
+        }
+        totalClicks = count ?? 0;
+
+        const progressKey = `clicker_bonus_progress_${player.id}`;
+        let savedProgress = null;
+        try {
+            const storedProgress = localStorage.getItem(progressKey);
+            savedProgress = storedProgress ? JSON.parse(storedProgress) : null;
+        } catch (error) {
+            console.warn('Progression du bonus invalide, elle sera réinitialisée :', error);
+        }
+
+        if (
+            Number.isInteger(savedProgress?.clicksSinceBonus) &&
+            Number.isInteger(savedProgress?.nextBonusAt) &&
+            savedProgress.nextBonusAt > 0
+        ) {
+            clicksSinceBonus = savedProgress.clicksSinceBonus;
+            nextBonusAt = savedProgress.nextBonusAt;
+            familyExtraRemainder = Number.isFinite(savedProgress.familyExtraRemainder)
+                ? savedProgress.familyExtraRemainder
+                : 0;
+        } else {
+            clicksSinceBonus = 0;
+            nextBonusAt = randomBonusInterval();
+        }
+
+        await refreshActiveFamilyPlayers();
+        clickSubscription = subscribeToClickerScores('public:ClickerCompetition', scheduleLeaderboardRefresh);
         await refreshLeaderboard();
-        clickSubscription = subscribeToClickerScores('public:ClickerCompetition', refreshLeaderboard);
         isLoading = false;
     }
 
     async function handleClick() {
-        if (isCooldown || !currentPlayer) return;
+        if (!currentPlayer) return;
 
-        isCooldown = true;
-        const { error } = await recordClick(currentPlayer.id);
+        clickErrorMessage = '';
+        animateClick();
+        const player = currentPlayer;
+        recordPlayerClick(player);
+    }
 
-        if (!error) {
-            await refreshLeaderboard();
+    /**
+     * @param {Player} player
+     */
+    async function recordPlayerClick(player) {
+        const nextClickCount = clicksSinceBonus + 1;
+        const bonusTriggered = nextClickCount >= nextBonusAt;
+        const nextClicksSinceBonus = bonusTriggered ? 0 : nextClickCount;
+        const nextBonusTarget = bonusTriggered ? randomBonusInterval() : nextBonusAt;
+        const playerId = String(player.id);
+        const firstActiveClick = playerGroup !== null && !activeFamilyPlayerIds.has(playerId);
+        const membersForClick = activeFamilyPlayerCount + (firstActiveClick ? 1 : 0);
+        const coefficientForClick = membersForClick > 0
+            ? Math.pow(familyCoefficientPerPlayer, membersForClick)
+            : 1;
+        const accumulatedRemainder = familyExtraRemainder + coefficientForClick - 1;
+        const familyExtraClicks = Math.floor(accumulatedRemainder + 1e-9);
+        const nextFamilyRemainder = accumulatedRemainder - familyExtraClicks;
+        const extraClicks = familyExtraClicks + (bonusTriggered ? 1 : 0);
+
+        clicksSinceBonus = nextClicksSinceBonus;
+        nextBonusAt = nextBonusTarget;
+        familyExtraRemainder = nextFamilyRemainder;
+        totalClicks += 1 + extraClicks;
+
+        if (firstActiveClick) {
+            activeFamilyPlayerIds = new Set([...activeFamilyPlayerIds, playerId]);
+            activeFamilyPlayerCount = activeFamilyPlayerIds.size;
         }
 
-        setTimeout(() => {
-            isCooldown = false;
-        }, 100);
+        try {
+            localStorage.setItem(
+                `clicker_bonus_progress_${player.id}`,
+                JSON.stringify({ clicksSinceBonus, nextBonusAt, familyExtraRemainder })
+            );
+        } catch (storageError) {
+            console.warn('Impossible de sauvegarder la progression du joueur :', storageError);
+        }
+
+        const { error } = await recordClick(player.id, extraClicks);
+        if (error) {
+            console.error('Erreur enregistrement clic :', error);
+            clickErrorMessage = `Clic non enregistré : ${error.message}`;
+            await refreshActiveFamilyPlayers();
+            return;
+        }
+
+        if (extraClicks > 0) {
+            bonusMessage = `BONUS +${extraClicks} CLIC${extraClicks > 1 ? 'S' : ''} !`;
+            if (bonusMessageTimeout) window.clearTimeout(bonusMessageTimeout);
+            bonusMessageTimeout = window.setTimeout(() => {
+                bonusMessage = '';
+                bonusMessageTimeout = undefined;
+            }, 1500);
+        }
+
+        scheduleLeaderboardRefresh();
+    }
+
+    async function refreshActiveFamilyPlayers() {
+        const { playerIds, error } = await fetchActiveFamilyPlayers(playerGroup?.id);
+        if (error) {
+            console.error('Impossible de compter les joueurs actifs de la famille :', error);
+            return;
+        }
+
+        activeFamilyPlayerIds = playerIds;
+        activeFamilyPlayerCount = playerIds.size;
+    }
+
+    function randomBonusInterval() {
+        return Math.floor(Math.random() * (bonusMaxClicks - bonusMinClicks + 1)) + bonusMinClicks;
+    }
+
+    function animateClick() {
+        const newParticles = Array.from({ length: 7 }, () => ({
+            id: ++nextParticleId,
+            left: 20 + Math.random() * 60,
+            top: 20 + Math.random() * 60,
+            rotation: Math.round(Math.random() * 120 - 60)
+        }));
+        clickParticles = [...clickParticles, ...newParticles];
+
+        const particleIds = newParticles.map((particle) => particle.id);
+        const timeout = window.setTimeout(() => {
+            clickParticles = clickParticles.filter((particle) => !particleIds.includes(particle.id));
+            particleTimeouts = particleTimeouts.filter((timer) => timer !== timeout);
+        }, 750);
+        particleTimeouts.push(timeout);
     }
 
     async function refreshLeaderboard() {
         leaderboard = await fetchTeamScores();
+    }
+
+    function scheduleLeaderboardRefresh() {
+        if (leaderboardTimeout) window.clearTimeout(leaderboardTimeout);
+        leaderboardTimeout = window.setTimeout(() => {
+            leaderboardTimeout = undefined;
+            refreshLeaderboard();
+            refreshActiveFamilyPlayers();
+        }, 200);
     }
 
     async function logout() {
@@ -234,14 +422,37 @@
         <!-- 2. BOUTON CIRCULAIRE (CENTRE) -->
         <section class="my-auto py-6 text-center flex flex-col items-center justify-center">
             <button 
-                disabled={isCooldown} 
                 onclick={handleClick}
-                class={`w-52 h-52 rounded-full border-4 ${style.border} ${style.btn} text-white text-2xl font-black uppercase tracking-widest shadow-2xl transform active:scale-90 transition-all flex flex-col items-center justify-center space-y-2 ${isCooldown ? 'opacity-60 cursor-not-allowed scale-95' : 'hover:scale-105'}`}
+                style={`--heat: ${Math.min(totalClicks / 200, 0.7)};`}
+                class={`heat-button relative w-52 h-52 rounded-full border-4 ${style.border} ${style.btn} text-white text-2xl font-black uppercase tracking-widest shadow-2xl transform active:scale-90 transition-all flex flex-col items-center justify-center space-y-2 hover:scale-105`}
             >
-                <span class="text-5xl">{isCooldown ? '⏳' : '⚡'}</span>
-                <span>{isCooldown ? 'Attente' : 'CLIQUER !'}</span>
+                {#each clickParticles as particle (particle.id)}
+                    <span
+                        aria-hidden="true"
+                        class="click-spark"
+                        style={`left: ${particle.left}%; top: ${particle.top}%; --rotation: ${particle.rotation}deg;`}
+                    >✦</span>
+                {/each}
+                <span class="text-5xl">⚡</span>
+                <span>CLIQUER !</span>
             </button>
-            <p class="text-[11px] text-slate-400 mt-4 font-medium">Clic !</p>
+            <p class="text-[11px] text-slate-400 mt-4 font-medium">
+                Famille : {activeFamilyPlayerCount} joueur{activeFamilyPlayerCount === 1 ? '' : 's'} actif{activeFamilyPlayerCount === 1 ? '' : 's'} · ×{familyMultiplier.toLocaleString('fr-FR', { maximumFractionDigits: 3 })}
+            </p>
+            <p class="text-[11px] text-slate-400 mt-4 font-medium">
+                Famille : {activeFamilyPlayerCount} joueur{activeFamilyPlayerCount === 1 ? '' : 's'} actif{activeFamilyPlayerCount === 1 ? '' : 's'} · ×{familyMultiplier.toLocaleString('fr-FR', { maximumFractionDigits: 3 })}
+            </p>
+            {#if bonusMessage}
+                <p class="text-sm font-bold text-amber-300 mt-2 animate-pulse">
+                    ✨ {bonusMessage}
+                </p>
+            {/if}
+            {#if clickErrorMessage}
+                <p role="alert" class="text-xs text-red-400 mt-2">{clickErrorMessage}</p>
+            {/if}
+            {#if settingsWarning}
+                <p class="text-[10px] text-amber-400 mt-2">{settingsWarning}</p>
+            {/if}
         </section>
 
         <!-- 3. BARRE DE NAVIGATION (BAS) -->
@@ -254,7 +465,44 @@
                 <span class="text-xl">👤</span>
                 <span>Joueurs</span>
             </a>
+            <a href="/maisons" class="flex flex-col items-center text-slate-400 hover:text-amber-400 font-medium text-[11px] transition">
+                <span class="text-xl">🏆</span>
+                <span>Maisons</span>
+            </a>
         </nav>
     {/if}
 
 </main>
+
+<style>
+    .heat-button {
+        background-image: linear-gradient(
+            rgba(239, 68, 68, var(--heat)),
+            rgba(239, 68, 68, var(--heat))
+        );
+        filter: saturate(calc(1 + var(--heat)));
+    }
+
+    .click-spark {
+        position: absolute;
+        z-index: 1;
+        color: #fde68a;
+        font-size: 1.25rem;
+        pointer-events: none;
+        animation: spark-rise 700ms ease-out forwards;
+    }
+
+    @keyframes spark-rise {
+        0% {
+            opacity: 0;
+            transform: translate(-50%, -50%) scale(0.3) rotate(0);
+        }
+        20% {
+            opacity: 1;
+        }
+        100% {
+            opacity: 0;
+            transform: translate(calc(-50% + 16px), calc(-50% - 42px)) scale(1.3) rotate(var(--rotation));
+        }
+    }
+</style>

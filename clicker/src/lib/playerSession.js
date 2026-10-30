@@ -34,7 +34,7 @@ export async function findPlayerByEmail(email) {
         .from('player')
         .select('*, group(id, name)')
         .eq('email', email.trim().toLowerCase())
-        .single();
+        .maybeSingle();
 
     return { player: data, error };
 }

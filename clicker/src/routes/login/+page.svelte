@@ -16,7 +16,13 @@
     onMount(async () => {
         const savedEmail = getSavedPlayerEmail();
         if (savedEmail) {
-            const { player } = await findPlayerByEmail(savedEmail);
+            emailInput = savedEmail;
+            const { player, error } = await findPlayerByEmail(savedEmail);
+            if (error) {
+                errorMessage = "Impossible de vérifier la session. Réessayez.";
+                isCheckingSession = false;
+                return;
+            }
             if (player) {
                 await goto('/', { replaceState: true });
                 return;
@@ -33,9 +39,7 @@
 
         const { player, error } = await findPlayerByEmail(emailInput);
         if (error || !player) {
-            errorMessage = error
-                ? "Impossible de vérifier cet e-mail. Réessayez."
-                : "Aucun joueur trouvé avec cet e-mail.";
+            errorMessage = error ? "Impossible de vérifier cet e-mail. Réessayez." : "Aucun joueur trouvé avec cet e-mail.";
             isSubmitting = false;
             return;
         }

@@ -15,11 +15,11 @@
     let clickSubscription;
 
     onMount(async () => {
-        await fetchIndividualScores();
         clickSubscription = subscribeToClickerScores(
             'public:ClickerCompetitionScores',
             fetchIndividualScores
         );
+        await fetchIndividualScores();
     });
 
     onDestroy(() => {
@@ -78,6 +78,10 @@
         <a href="/scores" class="flex flex-col items-center text-amber-400 font-bold text-[11px]">
             <span class="text-xl">👤</span>
             <span>Joueurs</span>
+        </a>
+        <a href="/maisons" class="flex flex-col items-center text-slate-400 hover:text-amber-400 font-medium text-[11px] transition">
+            <span class="text-xl">🏆</span>
+            <span>Maisons</span>
         </a>
     </nav>
 
