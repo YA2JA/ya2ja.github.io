@@ -234,6 +234,13 @@
         recordPlayerClick(player);
     }
 
+    /** @param {KeyboardEvent} event */
+    function preventEnterRepeat(event) {
+        if (event.key === 'Enter' && event.repeat) {
+            event.preventDefault();
+        }
+    }
+
     /**
      * @param {Player} player
      */
@@ -423,6 +430,7 @@
         <section class="my-auto py-6 text-center flex flex-col items-center justify-center">
             <button 
                 onclick={handleClick}
+                onkeydown={preventEnterRepeat}
                 style={`--heat: ${Math.min(totalClicks / 200, 0.7)};`}
                 class={`heat-button relative w-52 h-52 rounded-full border-4 ${style.border} ${style.btn} text-white text-2xl font-black uppercase tracking-widest shadow-2xl transform active:scale-90 transition-all flex flex-col items-center justify-center space-y-2 hover:scale-105`}
             >
