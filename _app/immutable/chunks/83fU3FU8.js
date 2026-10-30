@@ -1,0 +1,1 @@
+import{t as e}from"./MERbbXz_.js";var t=`player_email`;function n(){return localStorage.getItem(t)}function r(e){localStorage.setItem(t,e)}function i(){localStorage.removeItem(t)}async function a(t){let{data:n,error:r}=await e.from(`player`).select(`*, group(id, name)`).eq(`email`,t.trim().toLowerCase()).maybeSingle();return{player:n,error:r}}export{r as i,a as n,n as r,i as t};
