@@ -1,6 +1,7 @@
 import { supabase } from '../supabaseClient';
 
 const CLICKER_TABLE = 'ClickerCompetition';
+const CLICK_PAGE_SIZE = 1000;
 
 /**
  * @param {string | number} playerId
@@ -11,6 +12,35 @@ export async function recordClick(playerId, extraClicks = 0) {
     return supabase
         .from(CLICKER_TABLE)
         .insert(Array.from({ length: numberOfClicks }, () => ({ author_id: playerId })));
+}
+
+/**
+ * @template T
+ * @param {string} columns
+ * @returns {Promise<{ rows: T[] | null, error: import('@supabase/supabase-js').PostgrestError | null }>}
+ */
+async function fetchAllClickRows(columns) {
+    /** @type {T[]} */
+    const rows = [];
+    let offset = 0;
+    let totalCount = 0;
+
+    while (offset < totalCount || offset === 0) {
+        const { data, count, error } = await supabase
+            .from(CLICKER_TABLE)
+            .select(columns, { count: 'exact' })
+            .order('id', { ascending: true })
+            .range(offset, offset + CLICK_PAGE_SIZE - 1);
+
+        if (error) return { rows: null, error };
+        if (!data?.length) break;
+
+        rows.push(...data);
+        offset += data.length;
+        totalCount = count ?? offset;
+    }
+
+    return { rows, error: null };
 }
 
 export async function fetchClickerSettings() {
@@ -82,17 +112,18 @@ export async function fetchTeamScores() {
         ])
     );
 
-    const { data: clicks, error: clickError } = await supabase
-        .from(CLICKER_TABLE)
-        .select('id, player!inner(groupId)');
+    const { rows: clicks, error: clickError } = await fetchAllClickRows('id, player!inner(groupId)');
 
-    if (!clickError && clicks) {
-        clicks.forEach(/** @param {{ player: { groupId: string | number }[] | { groupId: string | number } | null }} click */ ({ player }) => {
-            const relatedPlayer = Array.isArray(player) ? player[0] : player;
-            const groupScore = relatedPlayer ? scores[relatedPlayer.groupId] : undefined;
-            if (groupScore) groupScore.clicks += 1;
-        });
+    if (clickError) {
+        console.error('Impossible de charger les clics des équipes :', clickError);
+        return Object.values(scores).sort((a, b) => b.clicks - a.clicks);
     }
+
+    clicks?.forEach(/** @param {{ player: { groupId: string | number }[] | { groupId: string | number } | null }} click */ ({ player }) => {
+        const relatedPlayer = Array.isArray(player) ? player[0] : player;
+        const groupScore = relatedPlayer ? scores[relatedPlayer.groupId] : undefined;
+        if (groupScore) groupScore.clicks += 1;
+    });
 
     return Object.values(scores).sort((a, b) => b.clicks - a.clicks);
 }
@@ -126,19 +157,19 @@ export async function fetchPlayerScores() {
         })
     );
 
-    const { data: clicks, error: clickError } = await supabase
-        .from(CLICKER_TABLE)
-        .select('author_id');
+    const { rows: clicks, error: clickError } = await fetchAllClickRows('author_id');
 
-    if (!clickError && clicks) {
-        clicks.forEach(/** @param {{ author_id: string | number | null }} click */ ({ author_id: authorId }) => {
-            if (authorId && scores[authorId]) scores[authorId].clicks += 1;
-        });
+    if (clickError || !clicks) {
+        return { scores: Object.values(scores).sort((a, b) => b.clicks - a.clicks), error: clickError };
     }
+
+    clicks.forEach(/** @param {{ author_id: string | number | null }} click */ ({ author_id: authorId }) => {
+        if (authorId && scores[authorId]) scores[authorId].clicks += 1;
+    });
 
     return {
         scores: Object.values(scores).sort((a, b) => b.clicks - a.clicks),
-        error: clickError
+        error: null
     };
 }
 
