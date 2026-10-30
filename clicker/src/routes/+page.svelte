@@ -447,9 +447,6 @@
             <p class="text-[11px] text-slate-400 mt-4 font-medium">
                 Famille : {activeFamilyPlayerCount} joueur{activeFamilyPlayerCount === 1 ? '' : 's'} actif{activeFamilyPlayerCount === 1 ? '' : 's'} · ×{familyMultiplier.toLocaleString('fr-FR', { maximumFractionDigits: 3 })}
             </p>
-            <p class="text-[11px] text-slate-400 mt-4 font-medium">
-                Famille : {activeFamilyPlayerCount} joueur{activeFamilyPlayerCount === 1 ? '' : 's'} actif{activeFamilyPlayerCount === 1 ? '' : 's'} · ×{familyMultiplier.toLocaleString('fr-FR', { maximumFractionDigits: 3 })}
-            </p>
             {#if bonusMessage}
                 <p class="text-sm font-bold text-amber-300 mt-2 animate-pulse">
                     ✨ {bonusMessage}
