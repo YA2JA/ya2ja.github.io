@@ -4,64 +4,32 @@
 </svelte:head>
 
 <script>
-    import { onMount } from 'svelte';
-    import { supabase } from '#lib/supabaseClient';
+    import { onDestroy, onMount } from 'svelte';
+    import { supabase } from '../../lib/supabaseClient';
+    import { fetchPlayerScores, subscribeToClickerScores } from '../../lib/games/clicker';
 
+    /** @type {Array<{ id: string | number, name: string, groupName: string, clicks: number }>} */
     let playerScores = $state([]);
     let isLoading = $state(true);
+    /** @type {import('@supabase/supabase-js').RealtimeChannel | undefined} */
+    let clickSubscription;
 
     onMount(async () => {
         await fetchIndividualScores();
-        subscribeToClicks();
+        clickSubscription = subscribeToClickerScores(
+            'public:ClickerCompetitionScores',
+            fetchIndividualScores
+        );
+    });
+
+    onDestroy(() => {
+        if (clickSubscription) supabase.removeChannel(clickSubscription);
     });
 
     async function fetchIndividualScores() {
-        // 1. Récupérer TOUS les joueurs avec leur équipe
-        const { data: allPlayers, error: playerErr } = await supabase
-            .from('player')
-            .select('id, name, group(name)');
-
-        if (playerErr || !allPlayers) {
-            isLoading = false;
-            return;
-        }
-
-        // 2. Initialiser le dictionnaire des clics par joueur (0 par défaut)
-        const scoresMap = {};
-        allPlayers.forEach(p => {
-            scoresMap[p.id] = {
-                id: p.id,
-                name: p.name || 'Guerrier Anonyme',
-                groupName: p.group?.name || 'Sans Équipe',
-                clicks: 0
-            };
-        });
-
-        // 3. Compter les clics associés à chaque auteur (author_id)
-        const { data: clicksData, error: clickErr } = await supabase
-            .from('ClickerCompetition')
-            .select('author_id');
-
-        if (!clickErr && clicksData) {
-            clicksData.forEach(item => {
-                if (item.author_id && scoresMap[item.author_id]) {
-                    scoresMap[item.author_id].clicks += 1;
-                }
-            });
-        }
-
-        // 4. Trier par nombre de clics décroissant
-        playerScores = Object.values(scoresMap).sort((a, b) => b.clicks - a.clicks);
+        const { scores } = await fetchPlayerScores();
+        playerScores = scores;
         isLoading = false;
-    }
-
-    function subscribeToClicks() {
-        supabase
-            .channel('public:ClickerCompetitionScores')
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ClickerCompetition' }, () => {
-                fetchIndividualScores();
-            })
-            .subscribe();
     }
 </script>
 

@@ -4,18 +4,33 @@
 </svelte:head>
 
 <script>
-    import { onMount } from 'svelte';
-    import { supabase } from '#lib/supabaseClient';
+    import { onDestroy, onMount } from 'svelte';
+    import { goto } from '$app/navigation';
+    import { supabase } from '../lib/supabaseClient';
+    import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail } from '../lib/playerSession';
+    import { fetchTeamScores, recordClick, subscribeToClickerScores } from '../lib/games/clicker';
+
+    /**
+     * @typedef {{
+     *   id: string | number,
+     *   name: string | null,
+     *   group: { id: string | number, name: string } | null
+     * }} Player
+     */
+    /** @type {Player | null} */
+    let currentPlayer = $state(null);
+    /** @type {{ id: string | number, name: string } | null} */
+    let playerGroup = $state(null);
+    /** @type {Array<{ id: string | number, name: string, clicks: number }>} */
+    let leaderboard = $state([]);
+    /** @type {import('@supabase/supabase-js').RealtimeChannel | undefined} */
+    let clickSubscription;
 
     // États du jeu
     let isLoading = $state(true);
     let isMobile = $state(true);
     let isDebugMode = $state(false);
-    let emailInput = $state('');
-    let currentPlayer = $state(null);
-    let playerGroup = $state(null);
-    let leaderboard = $state([]);
-    let errorMessage = $state('');
+    let authError = $state('');
     let isCooldown = $state(false);
 
     // Thèmes visuels des maisons
@@ -46,6 +61,7 @@
         }
     };
 
+    /** @param {string | null | undefined} groupName */
     function getHouseStyle(groupName) {
         if (!groupName) return houseStyles.default;
         const name = groupName.toLowerCase();
@@ -58,18 +74,17 @@
     onMount(async () => {
         await checkDebugMode();
 
-        const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+        const userAgent = navigator.userAgent || navigator.vendor || '';
         const isMobileUA = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent);
         const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
         
         isMobile = isMobileUA && hasTouch;
-        isLoading = false;
 
-        const savedEmail = localStorage.getItem('player_email');
-        if (savedEmail) {
-            emailInput = savedEmail;
-            loginUser();
-        }
+        await restorePlayerSession();
+    });
+
+    onDestroy(() => {
+        if (clickSubscription) supabase.removeChannel(clickSubscription);
     });
 
     async function checkDebugMode() {
@@ -79,49 +94,50 @@
                 .select('is_debug');
 
             if (!error && data && data.length > 0) {
-                isDebugMode = data.some(row => row.is_debug === true || row.is_debug === 'true' || row.is_debug === 'TRUE');
+                isDebugMode = data.some(/** @param {{ is_debug: boolean | string }} row */ (row) =>
+                    row.is_debug === true || row.is_debug === 'true' || row.is_debug === 'TRUE'
+                );
             }
         } catch (err) {
             console.error("Erreur vérification debug :", err);
         }
     }
 
-    async function loginUser() {
-        errorMessage = '';
-        if (!emailInput) return;
+    async function restorePlayerSession() {
+        const savedEmail = getSavedPlayerEmail();
+        if (!savedEmail) {
+            await goto('/login', { replaceState: true });
+            return;
+        }
 
-        const cleanEmail = emailInput.trim().toLowerCase();
+        const { player, error } = await findPlayerByEmail(savedEmail);
+        if (error) {
+            authError = "Impossible de vérifier la session. Réessayez.";
+            isLoading = false;
+            return;
+        }
 
-        const { data: player, error } = await supabase
-            .from('player')
-            .select('*, group(id, name)')
-            .eq('email', cleanEmail)
-            .single();
-
-        if (error || !player) {
-            errorMessage = "Aucun joueur trouvé avec cet e-mail.";
+        if (!player) {
+            clearPlayerEmail();
+            await goto('/login', { replaceState: true });
             return;
         }
 
         currentPlayer = player;
         playerGroup = player.group;
-        localStorage.setItem('player_email', player.email);
-        
-        fetchLeaderboard();
-        subscribeToClicks();
+        await refreshLeaderboard();
+        clickSubscription = subscribeToClickerScores('public:ClickerCompetition', refreshLeaderboard);
+        isLoading = false;
     }
 
     async function handleClick() {
         if (isCooldown || !currentPlayer) return;
 
         isCooldown = true;
-
-        const { error } = await supabase
-            .from('ClickerCompetition')
-            .insert([{ author_id: currentPlayer.id }]);
+        const { error } = await recordClick(currentPlayer.id);
 
         if (!error) {
-            fetchLeaderboard();
+            await refreshLeaderboard();
         }
 
         setTimeout(() => {
@@ -129,47 +145,15 @@
         }, 100);
     }
 
-    async function fetchLeaderboard() {
-        const { data: allGroups, error: groupErr } = await supabase
-            .from('group')
-            .select('id, name');
-
-        if (groupErr || !allGroups) return;
-
-        const groupScores = {};
-        allGroups.forEach(g => {
-            groupScores[g.id] = { id: g.id, name: g.name, clicks: 0 };
-        });
-
-        const { data: clicksData, error: clickErr } = await supabase
-            .from('ClickerCompetition')
-            .select('id, player!inner(groupId)');
-
-        if (!clickErr && clicksData) {
-            clicksData.forEach(item => {
-                const gId = item.player?.groupId;
-                if (gId !== undefined && groupScores[gId]) {
-                    groupScores[gId].clicks += 1;
-                }
-            });
-        }
-
-        leaderboard = Object.values(groupScores).sort((a, b) => b.clicks - a.clicks);
+    async function refreshLeaderboard() {
+        leaderboard = await fetchTeamScores();
     }
 
-    function subscribeToClicks() {
-        supabase
-            .channel('public:ClickerCompetition')
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ClickerCompetition' }, () => {
-                fetchLeaderboard();
-            })
-            .subscribe();
-    }
-
-    function logout() {
-        localStorage.removeItem('player_email');
+    async function logout() {
+        clearPlayerEmail();
         currentPlayer = null;
         playerGroup = null;
+        await goto('/login', { replaceState: true });
     }
 </script>
 
@@ -190,53 +174,14 @@
             </p>
         </div>
 
-    {:else if !currentPlayer}
-        <!-- Écran de Connexion -->
-        <div class="my-auto bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-6">
-            
-            {#if isDebugMode && !isMobile}
-                <div class="bg-amber-500/20 border border-amber-500/50 text-amber-300 text-[10px] uppercase font-bold p-2 rounded-xl text-center">
-                    🛠️ Mode Debug Actif (Accès PC Débloqué)
-                </div>
-            {/if}
-
-            <div class="text-center space-y-2">
-                <div class="text-5xl">🛡️</div>
-                <h1 class="text-2xl font-extrabold text-amber-400 tracking-wider uppercase">
-                    Tournoi des Maisons
-                </h1>
-                <p class="text-xs text-slate-400">Entrez votre adresse e-mail pour accéder au jeu</p>
-            </div>
-
-            <form onsubmit={(e) => { e.preventDefault(); loginUser(); }} class="space-y-4">
-                <div>
-                    <label for="email" class="block text-xs font-semibold text-slate-300 uppercase mb-1">
-                        Adresse E-mail
-                    </label>
-                    <input 
-                        type="email" 
-                        id="email" 
-                        bind:value={emailInput} 
-                        placeholder="votre.email@domaine.com" 
-                        required 
-                        class="w-full px-4 py-3 bg-slate-950 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-amber-400 transition"
-                    />
-                </div>
-
-                <button 
-                    type="submit" 
-                    class="w-full py-3.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold uppercase rounded-xl shadow-lg transition active:scale-95"
-                >
-                    Rejoindre l'Arène
-                </button>
-            </form>
-
-            {#if errorMessage}
-                <div class="p-3 bg-red-950/80 border border-red-500/50 rounded-xl text-red-300 text-xs text-center">
-                    {errorMessage}
-                </div>
-            {/if}
+    {:else if authError}
+        <div role="alert" class="my-auto bg-slate-900 border border-red-500/50 rounded-2xl p-6 text-center space-y-3">
+            <p class="text-red-300 text-sm">{authError}</p>
+            <button onclick={() => location.reload()} class="text-amber-400 underline text-sm">Réessayer</button>
         </div>
+
+    {:else if !currentPlayer}
+        <div class="my-auto text-center text-slate-400">Redirection vers la connexion...</div>
 
     {:else}
         {@const style = getHouseStyle(playerGroup?.name)}

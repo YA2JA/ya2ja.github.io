@@ -1,0 +1,100 @@
+import { supabase } from '../supabaseClient';
+
+const CLICKER_TABLE = 'ClickerCompetition';
+
+/** @param {string | number} playerId */
+export async function recordClick(playerId) {
+    return supabase.from(CLICKER_TABLE).insert([{ author_id: playerId }]);
+}
+
+/** @returns {Promise<Array<{ id: string | number, name: string, clicks: number }>>} */
+export async function fetchTeamScores() {
+    const { data: groups, error: groupError } = await supabase
+        .from('group')
+        .select('id, name');
+
+    if (groupError || !groups) return [];
+
+    /** @type {Record<string, { id: string | number, name: string, clicks: number }>} */
+    const scores = Object.fromEntries(
+        groups.map(/** @param {{ id: string | number, name: string }} group */ (group) => [
+            group.id,
+            { ...group, clicks: 0 }
+        ])
+    );
+
+    const { data: clicks, error: clickError } = await supabase
+        .from(CLICKER_TABLE)
+        .select('id, player!inner(groupId)');
+
+    if (!clickError && clicks) {
+        clicks.forEach(/** @param {{ player: { groupId: string | number }[] | { groupId: string | number } | null }} click */ ({ player }) => {
+            const relatedPlayer = Array.isArray(player) ? player[0] : player;
+            const groupScore = relatedPlayer ? scores[relatedPlayer.groupId] : undefined;
+            if (groupScore) groupScore.clicks += 1;
+        });
+    }
+
+    return Object.values(scores).sort((a, b) => b.clicks - a.clicks);
+}
+
+/**
+ * @returns {Promise<{
+ *   scores: Array<{ id: string | number, name: string, groupName: string, clicks: number }>,
+ *   error: import('@supabase/supabase-js').PostgrestError | null
+ * }>}
+ */
+export async function fetchPlayerScores() {
+    const { data: players, error: playerError } = await supabase
+        .from('player')
+        .select('id, name, group(name)');
+
+    if (playerError || !players) return { scores: [], error: playerError };
+
+    /** @type {Record<string, { id: string | number, name: string, groupName: string, clicks: number }>} */
+    const scores = Object.fromEntries(
+        players.map(/** @param {{ id: string | number, name: string | null, group: { name: string }[] | { name: string } | null }} player */ (player) => {
+            const group = Array.isArray(player.group) ? player.group[0] : player.group;
+            return [
+                player.id,
+                {
+                    id: player.id,
+                    name: player.name || 'Guerrier Anonyme',
+                    groupName: group?.name || 'Sans Équipe',
+                    clicks: 0
+                }
+            ];
+        })
+    );
+
+    const { data: clicks, error: clickError } = await supabase
+        .from(CLICKER_TABLE)
+        .select('author_id');
+
+    if (!clickError && clicks) {
+        clicks.forEach(/** @param {{ author_id: string | number | null }} click */ ({ author_id: authorId }) => {
+            if (authorId && scores[authorId]) scores[authorId].clicks += 1;
+        });
+    }
+
+    return {
+        scores: Object.values(scores).sort((a, b) => b.clicks - a.clicks),
+        error: clickError
+    };
+}
+
+/**
+ * @param {string} channelName
+ * @param {() => void | Promise<void>} onInsert
+ * @returns {import('@supabase/supabase-js').RealtimeChannel}
+ */
+export function subscribeToClickerScores(channelName, onInsert) {
+    return supabase
+        .channel(channelName)
+        .on('postgres_changes', {
+            event: 'INSERT',
+            schema: 'public',
+            table: CLICKER_TABLE
+        }, onInsert)
+        .subscribe();
+}
