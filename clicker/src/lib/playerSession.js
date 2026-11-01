@@ -13,15 +13,18 @@ const PLAYER_EMAIL_KEY = 'player_email';
 
 /** @returns {string | null} */
 export function getSavedPlayerEmail() {
+    if (typeof window === 'undefined') return null;
     return localStorage.getItem(PLAYER_EMAIL_KEY);
 }
 
 /** @param {string} email */
 export function savePlayerEmail(email) {
+    if (typeof window === 'undefined') return;
     localStorage.setItem(PLAYER_EMAIL_KEY, email);
 }
 
 export function clearPlayerEmail() {
+    if (typeof window === 'undefined') return;
     localStorage.removeItem(PLAYER_EMAIL_KEY);
 }
 

@@ -1,4 +1,4 @@
-import { supabase } from '../supabaseClient';
+import { supabase } from '#lib/supabaseClient';
 
 const CLICKER_TABLE = 'ClickerCompetition';
 const CLICK_PAGE_SIZE = 1000;
@@ -35,7 +35,7 @@ async function fetchAllClickRows(columns) {
         if (error) return { rows: null, error };
         if (!data?.length) break;
 
-        rows.push(...data);
+        rows.push(.../** @type {any} */ (data));
         offset += data.length;
         totalCount = count ?? offset;
     }

@@ -1,12 +1,11 @@
 <svelte:head>
     <title>Connexion - Tournoi des Maisons</title>
-    <script src="https://cdn.tailwindcss.com"></script>
 </svelte:head>
 
 <script>
     import { onMount } from 'svelte';
     import { goto } from '$app/navigation';
-    import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail, savePlayerEmail } from '../../lib/playerSession';
+    import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail, savePlayerEmail } from '#lib/playerSession';
 
     let emailInput = $state('');
     let errorMessage = $state('');
@@ -33,7 +32,9 @@
         isCheckingSession = false;
     });
 
-    async function loginUser() {
+    /** @param {SubmitEvent} event */
+    async function handleSubmit(event) {
+        event.preventDefault();
         errorMessage = '';
         isSubmitting = true;
 
@@ -62,7 +63,7 @@
                 <p class="text-xs text-slate-400">Entrez votre adresse e-mail pour accéder au jeu</p>
             </header>
 
-            <form onsubmit={(event) => { event.preventDefault(); loginUser(); }} class="space-y-4">
+            <form onsubmit={handleSubmit} class="space-y-4">
                 <div>
                     <label for="email" class="block text-xs font-semibold text-slate-300 uppercase mb-1">
                         Adresse E-mail

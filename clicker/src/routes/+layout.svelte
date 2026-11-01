@@ -1,6 +1,4 @@
 <script>
-	export const prerender = true;
-	export const ssr = false;
 	import favicon from '#lib/assets/favicon.svg';
 
 	/** @type {{children: import('svelte').Snippet}} */
@@ -9,6 +7,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
+	<script src="https://cdn.tailwindcss.com"></script>
 </svelte:head>
 
 {@render children()}

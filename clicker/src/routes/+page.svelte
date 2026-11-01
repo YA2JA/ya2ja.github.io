@@ -1,20 +1,21 @@
 <svelte:head>
     <title>Tournoi des Maisons - Clicker</title>
-    <script src="https://cdn.tailwindcss.com"></script>
 </svelte:head>
 
 <script>
     import { onDestroy, onMount } from 'svelte';
     import { goto } from '$app/navigation';
-    import { supabase } from '../lib/supabaseClient';
-    import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail } from '../lib/playerSession';
+    import { supabase } from '#lib/supabaseClient';
+    import { clearPlayerEmail, findPlayerByEmail, getSavedPlayerEmail } from '#lib/playerSession';
     import {
         fetchActiveFamilyPlayers,
         fetchClickerSettings,
         fetchTeamScores,
         recordClick,
         subscribeToClickerScores
-    } from '../lib/games/clicker';
+    } from '#lib/games/clicker';
+    import { playClickSound, playBonusSound, triggerHaptic, isMuted, toggleMute } from '#lib/sound';
+    import Navigation from '#lib/components/Navigation.svelte';
 
     /**
      * @typedef {{
@@ -44,9 +45,8 @@
     let nextBonusAt = $state(30);
     let familyExtraRemainder = 0;
     let familyCoefficientPerPlayer = 1.1;
-    let activeFamilyPlayerCount = $state(0);
-    let activeFamilyPlayerIds = new Set();
-    /** @type {number} */
+    let activeFamilyPlayerIds = $state(/** @type {Set<string>} */ (new Set()));
+    let activeFamilyPlayerCount = $derived(activeFamilyPlayerIds.size);
     let familyMultiplier = $derived(
         activeFamilyPlayerCount > 0
             ? Math.pow(familyCoefficientPerPlayer, activeFamilyPlayerCount)
@@ -55,15 +55,31 @@
     let bonusMinClicks = 30;
     let bonusMaxClicks = 60;
     let bonusMessage = $state('');
-    /** @type {Array<{ id: number, left: number, top: number, rotation: number }>} */
+
+    // Effets visuels & sonores du click
+    let soundMuted = $state(false);
+    let comboStreak = $state(0);
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let comboTimeout;
+    let isSquished = $state(false);
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let squishTimeout;
+    /** @type {Array<{ id: number, text: string, x: number, y: number, isBonus: boolean }>} */
+    let floatingNumbers = $state([]);
+    let nextFloatId = 0;
+    /** @type {Array<{ id: number }>} */
+    let shockwaves = $state([]);
+    let nextWaveId = 0;
+    /** @type {Array<{ id: number, left: number, top: number, rotation: number, emoji: string }>} */
     let clickParticles = $state([]);
     /** @type {ReturnType<typeof setTimeout>[]} */
     let particleTimeouts = [];
+    let nextParticleId = 0;
+
     /** @type {ReturnType<typeof setTimeout> | undefined} */
     let leaderboardTimeout;
     /** @type {ReturnType<typeof setTimeout> | undefined} */
     let bonusMessageTimeout;
-    let nextParticleId = 0;
 
     // Thèmes visuels des maisons
     const houseStyles = {
@@ -103,7 +119,13 @@
         return houseStyles.default;
     }
 
+    /** @type {ReturnType<typeof setInterval> | undefined} */
+    let pollInterval;
+    let lastLeaderboardTotalClicks = -1;
+    let isRefreshingLeaderboard = false;
+
     onMount(async () => {
+        soundMuted = isMuted();
         await checkDebugMode();
 
         const userAgent = navigator.userAgent || navigator.vendor || '';
@@ -113,14 +135,25 @@
         isMobile = isMobileUA && hasTouch;
 
         await restorePlayerSession();
+
+        pollInterval = setInterval(() => {
+            refreshLeaderboard(false);
+        }, 2500);
     });
 
     onDestroy(() => {
+        if (pollInterval) clearInterval(pollInterval);
         if (clickSubscription) supabase.removeChannel(clickSubscription);
         if (leaderboardTimeout) window.clearTimeout(leaderboardTimeout);
         if (bonusMessageTimeout) window.clearTimeout(bonusMessageTimeout);
+        if (comboTimeout) window.clearTimeout(comboTimeout);
+        if (squishTimeout) window.clearTimeout(squishTimeout);
         particleTimeouts.forEach((timeout) => window.clearTimeout(timeout));
     });
+
+    function handleToggleMute() {
+        soundMuted = toggleMute();
+    }
 
     async function checkDebugMode() {
         try {
@@ -221,7 +254,7 @@
 
         await refreshActiveFamilyPlayers();
         clickSubscription = subscribeToClickerScores('public:ClickerCompetition', scheduleLeaderboardRefresh);
-        await refreshLeaderboard();
+        await refreshLeaderboard(true);
         isLoading = false;
     }
 
@@ -229,7 +262,6 @@
         if (!currentPlayer) return;
 
         clickErrorMessage = '';
-        animateClick();
         const player = currentPlayer;
         recordPlayerClick(player);
     }
@@ -239,6 +271,57 @@
         if (event.key === 'Enter' && event.repeat) {
             event.preventDefault();
         }
+    }
+
+    /**
+     * @param {number} extraClicks
+     */
+    function triggerJuicyEffects(extraClicks) {
+        // Combo streak
+        comboStreak += 1;
+        if (comboTimeout) window.clearTimeout(comboTimeout);
+        comboTimeout = window.setTimeout(() => {
+            comboStreak = 0;
+        }, 1300);
+
+        // Sound & Haptics
+        if (extraClicks > 0) {
+            playBonusSound();
+            triggerHaptic([30, 45, 60]);
+        } else {
+            playClickSound(comboStreak);
+            triggerHaptic(12);
+        }
+
+        // Squash & stretch animation
+        isSquished = true;
+        if (squishTimeout) window.clearTimeout(squishTimeout);
+        squishTimeout = window.setTimeout(() => {
+            isSquished = false;
+        }, 100);
+
+        // Shockwave ripple
+        const waveId = ++nextWaveId;
+        shockwaves = [...shockwaves, { id: waveId }];
+        const waveTimer = window.setTimeout(() => {
+            shockwaves = shockwaves.filter((w) => w.id !== waveId);
+        }, 550);
+        particleTimeouts.push(waveTimer);
+
+        // Floating points
+        const floatId = ++nextFloatId;
+        const isBonus = extraClicks > 0;
+        const text = isBonus ? `+${1 + extraClicks} BONUS!` : '+1';
+        const x = 50 + (Math.random() * 24 - 12);
+        const y = 35 + (Math.random() * 16 - 8);
+        floatingNumbers = [...floatingNumbers, { id: floatId, text, x, y, isBonus }];
+        const floatTimer = window.setTimeout(() => {
+            floatingNumbers = floatingNumbers.filter((f) => f.id !== floatId);
+        }, 800);
+        particleTimeouts.push(floatTimer);
+
+        // Burst particles
+        animateParticles(extraClicks > 0);
     }
 
     /**
@@ -265,9 +348,18 @@
         familyExtraRemainder = nextFamilyRemainder;
         totalClicks += 1 + extraClicks;
 
+        triggerJuicyEffects(extraClicks);
+
+        if (playerGroup) {
+            const myTeam = leaderboard.find((t) => String(t.id) === String(playerGroup?.id));
+            if (myTeam) {
+                myTeam.clicks += 1 + extraClicks;
+                leaderboard = [...leaderboard].sort((a, b) => b.clicks - a.clicks);
+            }
+        }
+
         if (firstActiveClick) {
             activeFamilyPlayerIds = new Set([...activeFamilyPlayerIds, playerId]);
-            activeFamilyPlayerCount = activeFamilyPlayerIds.size;
         }
 
         try {
@@ -307,19 +399,22 @@
         }
 
         activeFamilyPlayerIds = playerIds;
-        activeFamilyPlayerCount = playerIds.size;
     }
 
     function randomBonusInterval() {
         return Math.floor(Math.random() * (bonusMaxClicks - bonusMinClicks + 1)) + bonusMinClicks;
     }
 
-    function animateClick() {
-        const newParticles = Array.from({ length: 7 }, () => ({
+    /** @param {boolean} isBonus */
+    function animateParticles(isBonus) {
+        const emojis = isBonus ? ['✨', '💥', '⚡', '🌟', '✦'] : ['✦', '✨', '⚡'];
+        const count = isBonus ? 12 : 7;
+        const newParticles = Array.from({ length: count }, () => ({
             id: ++nextParticleId,
-            left: 20 + Math.random() * 60,
-            top: 20 + Math.random() * 60,
-            rotation: Math.round(Math.random() * 120 - 60)
+            left: 15 + Math.random() * 70,
+            top: 15 + Math.random() * 70,
+            rotation: Math.round(Math.random() * 120 - 60),
+            emoji: emojis[Math.floor(Math.random() * emojis.length)]
         }));
         clickParticles = [...clickParticles, ...newParticles];
 
@@ -331,8 +426,26 @@
         particleTimeouts.push(timeout);
     }
 
-    async function refreshLeaderboard() {
-        leaderboard = await fetchTeamScores();
+    /** @param {boolean} [force] */
+    async function refreshLeaderboard(force = false) {
+        if (isRefreshingLeaderboard) return;
+        isRefreshingLeaderboard = true;
+        try {
+            if (!force) {
+                const { count } = await supabase
+                    .from('ClickerCompetition')
+                    .select('id', { count: 'exact', head: true });
+                if (count !== null && count === lastLeaderboardTotalClicks && leaderboard.length > 0) {
+                    return;
+                }
+                if (count !== null) lastLeaderboardTotalClicks = count;
+            }
+            leaderboard = await fetchTeamScores();
+        } catch (err) {
+            console.error('Erreur rafraîchissement leaderboard :', err);
+        } finally {
+            isRefreshingLeaderboard = false;
+        }
     }
 
     function scheduleLeaderboardRefresh() {
@@ -384,14 +497,22 @@
         <div class="space-y-4">
             <!-- 1. CLASSEMENT ÉQUIPES (HAUT) -->
             <section class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl">
-                <h3 class="text-amber-400 font-bold uppercase text-center text-xs tracking-wider mb-3 flex items-center justify-center gap-2">
-                    🏆 Classement des Équipes
-                </h3>
+                <div class="flex items-center justify-between mb-3">
+                    <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-500/40 text-emerald-400 text-[10px] font-semibold">
+                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                        Direct
+                    </span>
+                    <h3 class="text-amber-400 font-bold uppercase text-center text-xs tracking-wider flex-1 mr-8 flex items-center justify-center gap-1.5">
+                        🏆 Classement des Équipes
+                    </h3>
+                </div>
 
                 <div class="space-y-2">
-                    {#each leaderboard as group, index}
+                    {#each leaderboard as group, index (group.id)}
                         {@const gStyle = getHouseStyle(group.name)}
-                        <div class={`flex items-center justify-between p-2.5 rounded-xl border transition ${group.id === playerGroup?.id ? `${gStyle.bg} ${gStyle.border} ring-1 ring-amber-400/50` : 'bg-slate-950/60 border-slate-800'}`}>
+                        <div
+                            class="flex items-center justify-between p-2.5 rounded-xl border transition-all duration-300 {group.id === playerGroup?.id ? `${gStyle.bg} ${gStyle.border} ring-1 ring-amber-400/50 shadow-md` : 'bg-slate-950/60 border-slate-800'}"
+                        >
                             <div class="flex items-center space-x-3">
                                 <span class="font-bold text-slate-500 w-5 text-center text-xs">
                                     #{index + 1}
@@ -416,34 +537,79 @@
                 </div>
                 
                 <div class="text-right">
-                    <span class={`inline-block px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${style.bg} ${style.border} ${style.text}`}>
+                    <span class="inline-block px-2.5 py-0.5 rounded-full text-[11px] font-bold border {style.bg} {style.border} {style.text}">
                         {playerGroup?.name || 'Sans Équipe'}
                     </span>
-                    <button onclick={logout} class="block text-right text-[10px] text-slate-400 hover:text-slate-200 mt-1 underline ml-auto">
-                        Déconnexion
-                    </button>
+                    <div class="flex items-center gap-2 justify-end mt-1">
+                        <button
+                            onclick={handleToggleMute}
+                            class="text-xs px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition"
+                            title={soundMuted ? 'Activer le son' : 'Couper le son'}
+                        >
+                            {soundMuted ? '🔇' : '🔊'}
+                        </button>
+                        <button onclick={logout} class="text-[10px] text-slate-400 hover:text-slate-200 underline">
+                            Déconnexion
+                        </button>
+                    </div>
                 </div>
             </header>
         </div>
 
         <!-- 2. BOUTON CIRCULAIRE (CENTRE) -->
-        <section class="my-auto py-6 text-center flex flex-col items-center justify-center">
-            <button 
-                onclick={handleClick}
-                onkeydown={preventEnterRepeat}
-                style={`--heat: ${Math.min(totalClicks / 200, 0.7)};`}
-                class={`heat-button relative w-52 h-52 rounded-full border-4 ${style.border} ${style.btn} text-white text-2xl font-black uppercase tracking-widest shadow-2xl transform active:scale-90 transition-all flex flex-col items-center justify-center space-y-2 hover:scale-105`}
-            >
-                {#each clickParticles as particle (particle.id)}
-                    <span
-                        aria-hidden="true"
-                        class="click-spark"
-                        style={`left: ${particle.left}%; top: ${particle.top}%; --rotation: ${particle.rotation}deg;`}
-                    >✦</span>
+        <section class="my-auto py-4 text-center flex flex-col items-center justify-center relative">
+            <!-- Combo streak badge -->
+            {#if comboStreak >= 3}
+                {@const comboGradient = comboStreak >= 25 ? 'from-fuchsia-500 via-pink-500 to-rose-500 animate-pulse ring-2 ring-pink-400' : comboStreak >= 15 ? 'from-amber-400 to-red-500 ring-2 ring-orange-400' : comboStreak >= 8 ? 'from-amber-400 to-orange-500' : 'from-yellow-400 to-amber-500'}
+                <div
+                    class="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-gradient-to-r {comboGradient} text-slate-950 font-black text-xs uppercase tracking-wider shadow-xl mb-3 animate-bounce select-none transform"
+                >
+                    <span class="text-sm">🔥</span>
+                    <span>Combo x{comboStreak} !</span>
+                </div>
+            {:else}
+                <div class="h-7 mb-3"></div>
+            {/if}
+
+            <div class="relative flex items-center justify-center">
+                <!-- Shockwaves -->
+                {#each shockwaves as wave (wave.id)}
+                    <span class="shockwave-ring" aria-hidden="true"></span>
                 {/each}
-                <span class="text-5xl">⚡</span>
-                <span>CLIQUER !</span>
-            </button>
+
+                <!-- Floating +1 / +BONUS -->
+                {#each floatingNumbers as num (num.id)}
+                    <span
+                        class="floating-num {num.isBonus ? 'text-amber-300 text-2xl font-black' : 'text-white text-lg font-extrabold'}"
+                        style:left="{num.x}%"
+                        style:top="{num.y}%"
+                        aria-hidden="true"
+                    >
+                        {num.text}
+                    </span>
+                {/each}
+
+                <!-- Main Punchy Button -->
+                <button 
+                    onclick={handleClick}
+                    onkeydown={preventEnterRepeat}
+                    style:--heat={Math.min(totalClicks / 200, 0.7)}
+                    class="heat-button relative w-52 h-52 rounded-full border-4 {style.border} {style.btn} text-white text-2xl font-black uppercase tracking-widest shadow-2xl transition-transform flex flex-col items-center justify-center space-y-2 select-none {isSquished ? 'scale-90 rotate-[-1deg]' : 'hover:scale-105 active:scale-95'}"
+                >
+                    {#each clickParticles as particle (particle.id)}
+                        <span
+                            aria-hidden="true"
+                            class="click-spark"
+                            style:left="{particle.left}%"
+                            style:top="{particle.top}%"
+                            style:--rotation="{particle.rotation}deg"
+                        >{particle.emoji}</span>
+                    {/each}
+                    <span class="text-5xl transition-transform duration-100 {isSquished ? 'scale-125 -rotate-6' : ''}">⚡</span>
+                    <span>CLIQUER !</span>
+                </button>
+            </div>
+
             <p class="text-[11px] text-slate-400 mt-4 font-medium">
                 Famille : {activeFamilyPlayerCount} joueur{activeFamilyPlayerCount === 1 ? '' : 's'} actif{activeFamilyPlayerCount === 1 ? '' : 's'} · ×{familyMultiplier.toLocaleString('fr-FR', { maximumFractionDigits: 3 })}
             </p>
@@ -461,20 +627,7 @@
         </section>
 
         <!-- 3. BARRE DE NAVIGATION (BAS) -->
-        <nav class="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-slate-900/95 backdrop-blur border-t border-slate-800 px-6 py-2.5 flex justify-around items-center z-50">
-            <a href="/" class="flex flex-col items-center text-amber-400 font-bold text-[11px]">
-                <span class="text-xl">⚡</span>
-                <span>Jeu</span>
-            </a>
-            <a href="/scores" class="flex flex-col items-center text-slate-400 hover:text-amber-400 font-medium text-[11px] transition">
-                <span class="text-xl">👤</span>
-                <span>Joueurs</span>
-            </a>
-            <a href="/maisons" class="flex flex-col items-center text-slate-400 hover:text-amber-400 font-medium text-[11px] transition">
-                <span class="text-xl">🏆</span>
-                <span>Maisons</span>
-            </a>
-        </nav>
+        <Navigation />
     {/if}
 
 </main>
@@ -486,6 +639,52 @@
             rgba(239, 68, 68, var(--heat))
         );
         filter: saturate(calc(1 + var(--heat)));
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .shockwave-ring {
+        position: absolute;
+        width: 13rem;
+        height: 13rem;
+        border-radius: 9999px;
+        border: 3px solid rgba(251, 191, 36, 0.7);
+        pointer-events: none;
+        animation: shockwave-expand 500ms ease-out forwards;
+    }
+
+    @keyframes shockwave-expand {
+        0% {
+            transform: scale(0.95);
+            opacity: 0.9;
+        }
+        100% {
+            transform: scale(1.45);
+            opacity: 0;
+        }
+    }
+
+    .floating-num {
+        position: absolute;
+        z-index: 20;
+        pointer-events: none;
+        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.8), 0 0 12px rgba(251, 191, 36, 0.6);
+        animation: float-up-fade 800ms ease-out forwards;
+    }
+
+    @keyframes float-up-fade {
+        0% {
+            opacity: 1;
+            transform: translate(-50%, 0) scale(0.7);
+        }
+        25% {
+            opacity: 1;
+            transform: translate(-50%, -24px) scale(1.25);
+        }
+        100% {
+            opacity: 0;
+            transform: translate(calc(-50% + 8px), -65px) scale(1);
+        }
     }
 
     .click-spark {
